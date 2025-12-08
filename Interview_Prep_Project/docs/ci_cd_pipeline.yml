@@ -1,0 +1,87 @@
+# Azure DevOps Pipeline for PySpark Application
+# This pipeline builds the Python package, runs tests, and publishes the artifact.
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  pythonVersion: '3.9'
+  projectRoot: '$(System.DefaultWorkingDirectory)'
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build and Test'
+  jobs:
+  - job: Build
+    displayName: 'Build Python Wheel & Run Tests'
+    steps:
+    
+    # 1. Set up Python
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+        addToPath: true
+      displayName: 'Set up Python $(pythonVersion)'
+
+    # 2. Install Dependencies
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pylint wheel
+      displayName: 'Install Dependencies'
+
+    # 3. Linting (Code Quality)
+    - script: |
+        pylint src/ --disable=C0111,C0103
+      displayName: 'Run Pylint'
+      continueOnError: true # Don't fail build on lint errors, just warn
+
+    # 4. Run Unit Tests (Pytest)
+    - script: |
+        pytest tests/ --doctest-modules --junitxml=junit/test-results.xml --cov=src --cov-report=xml
+      displayName: 'Run Unit Tests'
+
+    # 5. Publish Test Results
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/test-results.xml'
+        failTaskOnFailedTests: true
+      displayName: 'Publish Test Results'
+
+    # 6. Build Artifact (Python Wheel)
+    - script: |
+        python setup.py bdist_wheel
+      displayName: 'Build Python Wheel'
+
+    # 7. Publish Artifact
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: 'dist'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+      displayName: 'Publish Wheel Artifact'
+
+- stage: DeployToDev
+  displayName: 'Deploy to Dev Databricks'
+  dependsOn: BuildAndTest
+  condition: succeeded()
+  jobs:
+  - job: Deploy
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+    
+    - script: |
+        pip install databricks-cli
+        # Configure Databricks CLI (using service connection or env vars in real life)
+        # databricks configure --token
+        # databricks fs cp dist/*.whl dbfs:/FileStore/jars/
+      displayName: 'Deploy to DBFS'
