@@ -1,5 +1,3 @@
-# SCD Extreme Cases — Common Pitfalls & Anti-Patterns
-
-> The top mistakes people make, why they are dangerous, and how to detect and fix them.
-
-*Content to be developed at FAANG Principal-level depth.*
+# SCD Extreme Cases — Pitfalls & Anti-Patterns
+>
+> See [03_Hands_On_Examples.md](./03_Hands_On_Examples.md) — pitfalls are included in the combined file.

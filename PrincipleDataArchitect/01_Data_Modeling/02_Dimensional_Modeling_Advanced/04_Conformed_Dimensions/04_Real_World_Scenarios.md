@@ -1,5 +1,3 @@
-# Conformed Dimensions â€” FAANG War Stories & Real-World Scenarios
+# 04_Real_World_Scenarios
+> See [02_How_It_Works.md](./02_How_It_Works.md) — this section is included in the comprehensive How It Works file.
 
-> How Netflix, Amazon, LinkedIn, Uber, and Microsoft use this. Scale numbers, production incidents, lessons learned.
-
-*Content to be developed at FAANG Principal-level depth.*

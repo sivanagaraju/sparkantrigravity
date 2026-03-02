@@ -1,5 +1,3 @@
 # SCD Extreme Cases — FAANG War Stories & Real-World Scenarios
-
-> How Netflix, Amazon, LinkedIn, Uber, and Microsoft use this. Scale numbers, production incidents, lessons learned.
-
-*Content to be developed at FAANG Principal-level depth.*
+>
+> See [03_Hands_On_Examples.md](./03_Hands_On_Examples.md) — war stories are included in the combined file.

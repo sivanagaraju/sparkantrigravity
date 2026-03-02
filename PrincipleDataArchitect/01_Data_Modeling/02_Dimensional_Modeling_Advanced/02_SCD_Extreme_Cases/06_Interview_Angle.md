@@ -1,5 +1,3 @@
 # SCD Extreme Cases — Interview Angle
-
-> How this topic appears in Principal-level interviews. Sample questions, strong answer frameworks, what interviewers are really testing.
-
-*Content to be developed at FAANG Principal-level depth.*
+>
+> See [03_Hands_On_Examples.md](./03_Hands_On_Examples.md) — interview questions are included in the combined file.

@@ -1,5 +1,3 @@
-# Conformed Dimensions â€” Common Pitfalls & Anti-Patterns
+# 05_Pitfalls_And_Anti_Patterns
+> See [02_How_It_Works.md](./02_How_It_Works.md) — this section is included in the comprehensive How It Works file.
 
-> The top mistakes people make, why they are dangerous, and how to detect and fix them.
-
-*Content to be developed at FAANG Principal-level depth.*

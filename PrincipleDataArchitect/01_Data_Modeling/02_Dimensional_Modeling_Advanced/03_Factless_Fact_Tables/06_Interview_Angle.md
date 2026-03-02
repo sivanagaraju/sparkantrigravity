@@ -1,5 +1,3 @@
-# Factless Fact Tables â€” Interview Angle
+# 06_Interview_Angle
+> See [02_How_It_Works.md](./02_How_It_Works.md) — this section is included in the comprehensive How It Works file.
 
-> How this topic appears in Principal-level interviews. Sample questions, strong answer frameworks, what interviewers are really testing.
-
-*Content to be developed at FAANG Principal-level depth.*

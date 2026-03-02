@@ -1,5 +1,3 @@
-# SCD Extreme Cases — Further Reading & References
-
-> Papers, books, blog posts, conference talks, official documentation, and cross-references to related concepts in this curriculum.
-
-*Content to be developed at FAANG Principal-level depth.*
+# SCD Extreme Cases — Further Reading
+>
+> See [03_Hands_On_Examples.md](./03_Hands_On_Examples.md) — references are included in the combined file.

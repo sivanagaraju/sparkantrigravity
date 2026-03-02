@@ -1,47 +1,104 @@
 # Event Storming — Concept Overview
 
-> What it is, why a Principal Architect must know it, and where it fits in the bigger picture.
+> What it is, why it exists, what value it provides, and when to use (or avoid) it.
 
 ---
 
-## What Is Event Storming?
+## Why This Exists
 
-**Event Storming** is a collaborative workshop technique invented by Alberto Brandolini in 2013 for rapid domain discovery. It brings together engineers, product managers, domain experts, and stakeholders around a physical wall (or digital board like Miro) to map out *everything that happens* in a business process using color-coded sticky notes.
+**Origin**: Alberto Brandolini invented Event Storming in 2013 after observing that traditional requirements-gathering techniques (use cases, user stories, BRDs) consistently failed to capture the true complexity of business domains. The root cause: these techniques ask stakeholders to *describe* their processes, which introduces cognitive bias. People forget edge cases, simplify branching logic, and omit error paths.
 
-The result is a shared mental model of the business domain — expressed as a time-ordered sequence of **Domain Events** — that directly feeds into data modeling, schema design, Kafka topic definitions, and microservice boundary decisions.
+Event Storming flips the approach. Instead of asking "What do you want?", it asks "What *happens*?" — expressed as a time-ordered sequence of past-tense domain events on sticky notes. This surfaces the actual behavior of a system, including the parts nobody thinks to mention.
 
-## Why a Principal Data Architect Must Know This
+**The problem it solves**: Data architects design schemas from technical assumptions rather than business reality. The result is a data model that must be reworked 6-12 months later when the actual domain complexity emerges.
 
-| Reason | Impact |
+## What Value It Provides
+
+| Metric | Impact |
 |---|---|
-| **Prevents the #1 data modeling mistake** | Designing schemas from technical assumptions instead of actual business behavior |
-| **Drives Data Mesh domain boundaries** | Bounded Contexts discovered in Event Storming map 1:1 to Data Mesh domains |
-| **Defines event schemas for streaming** | Each Domain Event becomes a Kafka topic schema candidate |
-| **Creates shared vocabulary** | Eliminates "but marketing calls it X and finance calls it Y" problems |
-| **Surfaces hidden complexity early** | Hot spots reveal where your data model will have edge cases |
+| **Time to domain understanding** | 2-4 hours (vs. weeks of interviews and document reviews) |
+| **Schema rework reduction** | 60-80% fewer schema migrations in the first year |
+| **Cross-team alignment** | Single shared model eliminates "Marketing calls it X, Finance calls it Y" |
+| **Hidden complexity discovery** | Surfaces 20-30% more edge cases than traditional methods |
+| **Direct artifact output** | Events → fact tables, Aggregates → dimensions, Bounded Contexts → data domains |
 
-## Where It Fits in the Bigger Picture
+## Mindmap
+
+```mermaid
+mindmap
+  root((Event Storming))
+    Phases
+      Chaotic Exploration
+      Timeline Ordering
+      Aggregate Discovery
+      Policies and Read Models
+    Outputs
+      Domain Events
+        Fact Tables
+        Kafka Topics
+      Aggregates
+        Dimension Tables
+        Entity Schemas
+      Bounded Contexts
+        Data Domains
+        Microservice Boundaries
+      Policies
+        ETL Business Rules
+        Streaming Logic
+      Hot Spots
+        ADRs
+        Schema Design Decisions
+    Trade-offs
+      Requires Domain Experts in the Room
+      2-4 Hour Time Investment
+      Less Effective for Purely Technical Problems
+      Remote Sessions Lose Energy
+    Related Concepts
+      Bounded Contexts
+      Event Sourcing
+      CQRS
+      Data Mesh Domains
+      Data Contracts
+      Ubiquitous Language
+```
+
+## Where It Fits
 
 ```mermaid
 flowchart LR
-    ES["🟧 Event Storming<br/>(Domain Discovery)"] --> BC["📦 Bounded Contexts<br/>(Domain Boundaries)"]
-    BC --> DM["📐 Data Modeling<br/>(Schema Design)"]
-    BC --> KT["📡 Kafka Topics<br/>(Event Schemas)"]
-    BC --> MS["🔧 Microservices<br/>(Service Boundaries)"]
-    BC --> MESH["🌐 Data Mesh<br/>(Domain Ownership)"]
+    ES["Event Storming"] --> BC["Bounded Contexts"]
+    BC --> DM["Data Modeling<br/>(Star, Vault, Graph)"]
+    BC --> KT["Kafka Topic Design"]
+    BC --> MS["Microservice Boundaries"]
+    BC --> MESH["Data Mesh Domains"]
+    DM --> DW["Data Warehouse / Lakehouse"]
+    KT --> SP["Stream Processing"]
     
-    style ES fill:#FF6B35,color:#fff
-    style BC fill:#4ECDC4,color:#fff
+    style ES fill:#FF6B35,color:#fff,stroke:#333
+    style BC fill:#4ECDC4,color:#fff,stroke:#333
 ```
 
-Event Storming is **Step 0** — it happens before any ERD, any DDL, any Kafka topic. Without it, you're guessing.
+## When To Use / When NOT To Use
 
-## The 3 Levels of Event Storming
+| Scenario | Use Event Storming? | Why |
+|---|---|---|
+| New data platform from scratch | ✅ Yes | Prevents fundamental schema mistakes |
+| Migrating monolith to microservices | ✅ Yes | Reveals true domain boundaries |
+| Redesigning a data warehouse | ✅ Yes | Discovers missing/conflicting dimensions |
+| Optimizing a slow SQL query | ❌ No | This is a performance problem, not a domain problem |
+| Adding a column to an existing table | ❌ No | Overhead not justified for tactical changes |
+| Purely technical infrastructure decision | ❌ No | Event Storming is for business domain discovery |
+| Team of 2 engineers, no domain expert access | ⚠️ Limited | Core value comes from cross-functional collaboration |
 
-| Level | Duration | Goal | Participants |
-|---|---|---|---|
-| **Big Picture** | 2-4 hours | Map the entire business domain at high level | Everyone (30+ people) |
-| **Process Modeling** | 4-8 hours | Detail one specific process (e.g., Order → Delivery) | Domain experts + architects (8-12 people) |
-| **Design Level** | 1-2 days | Produce implementation-ready aggregates and events | Architects + senior engineers (4-6 people) |
+## Key Terminology
 
-A Principal Architect typically facilitates the Big Picture session and actively participates in the Design Level session.
+| Term | Precise Definition |
+|---|---|
+| **Domain Event** | A fact that happened in the past, expressed as a past-tense verb. Immutable. E.g., `Order Placed` |
+| **Command** | An action that triggers a domain event. E.g., `Place Order` |
+| **Aggregate** | The entity/cluster of entities that processes a command and emits an event. E.g., `Order` |
+| **Bounded Context** | A linguistic and logical boundary within which a specific domain model is consistent |
+| **Policy** | An automated business rule that reacts to an event. E.g., "When payment fails 3x, cancel order" |
+| **Read Model** | The data a user or system needs to make a decision. Maps to materialized views/reports |
+| **Hot Spot** | A point of disagreement or ambiguity. The most valuable output of the workshop |
+| **Ubiquitous Language** | The shared vocabulary agreed upon by all participants within a bounded context |
