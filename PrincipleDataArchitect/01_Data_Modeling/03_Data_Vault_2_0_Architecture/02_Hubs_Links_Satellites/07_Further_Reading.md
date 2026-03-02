@@ -1,5 +1,3 @@
-# Hubs Links Satellites â€” Further Reading & References
+# 07_Further_Reading
+> See [02_How_It_Works.md](./02_How_It_Works.md) — this section is included in the comprehensive How It Works file.
 
-> Papers, books, blog posts, conference talks, official documentation, and cross-references to related concepts in this curriculum.
-
-*Content to be developed at FAANG Principal-level depth.*

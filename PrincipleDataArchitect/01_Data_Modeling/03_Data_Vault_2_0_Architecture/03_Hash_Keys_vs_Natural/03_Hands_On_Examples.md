@@ -1,5 +1,3 @@
-# Hash Keys vs Natural â€” Hands-On Examples
+# 03_Hands_On_Examples
+> See [02_How_It_Works.md](./02_How_It_Works.md) — this section is included in the comprehensive How It Works file.
 
-> Real SQL/Python/Spark code, configuration examples, before-vs-after comparisons, exercises.
-
-*Content to be developed at FAANG Principal-level depth.*
