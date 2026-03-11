@@ -1,310 +1,187 @@
 # Valid Time vs Transaction Time — How It Works (Deep Internals)
 
-> HLD, ER diagrams, DDL table structures, sequence diagrams, state machines, and data flow.
+> ER diagrams, DDL, state diagrams, query patterns, and data flow.
 
 ---
 
-## High-Level Design — Temporal Architecture
-
-```mermaid
-flowchart TB
-    subgraph "Source Systems"
-        OLTP["OLTP (Oracle, Postgres)"]
-        API["External APIs"]
-        FILE["Flat Files / Late Corrections"]
-    end
-    
-    subgraph "Ingestion"
-        CDC["CDC Stream<br/>(Debezium / Golden Gate)"]
-        BATCH["Batch Loader"]
-    end
-    
-    subgraph "Bitemporal Layer"
-        BT["Bitemporal Table<br/>valid_from, valid_to<br/>txn_from, txn_to"]
-        IDX["Temporal Indexes<br/>(GiST range, B-tree composite)"]
-    end
-    
-    subgraph "Query Patterns"
-        CUR["Current State<br/>WHERE is_current = true"]
-        ASOF["As-Of Query<br/>FOR SYSTEM_TIME AS OF"]
-        RANGE["Range Query<br/>valid_from BETWEEN"]
-        CROSS["Cross-Time Query<br/>Both axes"]
-    end
-    
-    OLTP --> CDC --> BT
-    API --> BATCH --> BT
-    FILE --> BATCH
-    BT --> IDX
-    BT --> CUR
-    BT --> ASOF
-    BT --> RANGE
-    BT --> CROSS
-    
-    style BT fill:#FF6B35,color:#fff
-```
-
----
-
-## ER Diagram — Bitemporal Employee Record
+## ER Diagram — Bitemporal Table
 
 ```mermaid
 erDiagram
     EMPLOYEE_BITEMPORAL {
-        bigint employee_sk PK
-        int employee_id "Natural Key"
+        bigint employee_id PK "Business key"
+        bigint version_id PK "Unique row version"
         varchar employee_name
         varchar department
-        varchar job_title
         decimal salary
-        varchar office_location
-        date valid_from "When true in reality"
-        date valid_to "When no longer true in reality"
-        timestamp txn_from "When DB recorded this version"
-        timestamp txn_to "When DB superseded this version"
-        boolean is_current_valid "Latest valid-time version"
-        boolean is_current_txn "Latest transaction-time version"
+        varchar city
+        date valid_from "When TRUE in reality"
+        date valid_to "When CEASED in reality"
+        timestamp tx_from "When RECORDED in DB"
+        timestamp tx_to "When SUPERSEDED in DB"
     }
-    
-    DEPARTMENT_BITEMPORAL {
-        bigint dept_sk PK
-        int dept_id "Natural Key"
-        varchar dept_name
-        varchar cost_center
-        varchar vp_name
-        date valid_from
-        date valid_to
-        timestamp txn_from
-        timestamp txn_to
-    }
-    
-    EMPLOYEE_BITEMPORAL }o--|| DEPARTMENT_BITEMPORAL : "department (temporal FK)"
 ```
 
----
-
-## Table Structures
-
-### Bitemporal Fact Table — Trade Ledger
+## DDL — Bitemporal Table
 
 ```sql
 -- ============================================================
--- Bitemporal trade ledger
--- Two independent time axes: valid time (when the trade occurred)
--- and transaction time (when the system recorded it)
+-- BITEMPORAL TABLE: tracks both when facts were true AND when we knew
 -- ============================================================
 
-CREATE TABLE trade_ledger_bitemporal (
-    trade_version_sk    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+CREATE TABLE employee_bitemporal (
+    employee_id     INT           NOT NULL,
+    version_id      BIGINT GENERATED ALWAYS AS IDENTITY,
     
-    -- Natural key
-    trade_id            VARCHAR(50)    NOT NULL,
+    -- Descriptive attributes
+    employee_name   VARCHAR(200)  NOT NULL,
+    department      VARCHAR(100),
+    salary          DECIMAL(12,2),
+    city            VARCHAR(200),
     
-    -- Business attributes
-    instrument_id       VARCHAR(20)    NOT NULL,
-    counterparty_id     INT            NOT NULL,
-    trade_type          VARCHAR(10)    NOT NULL,  -- BUY, SELL, SHORT
-    quantity            DECIMAL(18,4)  NOT NULL,
-    price               DECIMAL(18,6)  NOT NULL,
-    notional_value      DECIMAL(20,2)  NOT NULL,
-    currency            CHAR(3)        NOT NULL,
-    trader_id           INT            NOT NULL,
-    desk_id             INT            NOT NULL,
+    -- VALID TIME: when was this true in the real world?
+    valid_from      DATE          NOT NULL,
+    valid_to        DATE          NOT NULL DEFAULT '9999-12-31',
     
-    -- VALID TIME: when was this trade effective in reality?
-    valid_from          DATE           NOT NULL,
-    valid_to            DATE           NOT NULL DEFAULT '9999-12-31',
+    -- TRANSACTION TIME: when was this recorded/superseded in the DB?
+    tx_from         TIMESTAMPTZ   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tx_to           TIMESTAMPTZ   NOT NULL DEFAULT '9999-12-31 23:59:59+00',
     
-    -- TRANSACTION TIME: when did the system learn about this version?
-    txn_from            TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    txn_to              TIMESTAMP      NOT NULL DEFAULT '9999-12-31 23:59:59',
+    PRIMARY KEY (employee_id, version_id),
     
-    -- Convenience flags
-    is_current_valid    BOOLEAN GENERATED ALWAYS AS (valid_to = '9999-12-31') STORED,
-    is_current_txn      BOOLEAN GENERATED ALWAYS AS (txn_to = '9999-12-31 23:59:59') STORED,
-    
-    -- Metadata
-    change_reason       VARCHAR(100),  -- INITIAL, CORRECTION, AMENDMENT, CANCELLATION
-    source_system       VARCHAR(50),
-    loaded_by           VARCHAR(100)
+    -- Constraints
+    CHECK (valid_from < valid_to),
+    CHECK (tx_from < tx_to)
 );
 
--- Composite index for bitemporal lookups
-CREATE INDEX idx_trade_bt_lookup 
-    ON trade_ledger_bitemporal(trade_id, valid_from, valid_to, txn_from, txn_to);
-
--- Current state fast path
-CREATE INDEX idx_trade_current 
-    ON trade_ledger_bitemporal(trade_id) 
-    WHERE is_current_valid = TRUE AND is_current_txn = TRUE;
-
--- Temporal range queries (PostgreSQL GiST)
--- CREATE INDEX idx_trade_valid_range 
---     ON trade_ledger_bitemporal USING GIST (daterange(valid_from, valid_to));
+-- Index for as-of queries
+CREATE INDEX idx_emp_bitemp_valid ON employee_bitemporal(employee_id, valid_from, valid_to);
+CREATE INDEX idx_emp_bitemp_tx ON employee_bitemporal(employee_id, tx_from, tx_to);
 ```
-
-### Bitemporal Dimension — Employee
-
-```sql
--- ============================================================
--- Bitemporal employee dimension
--- Tracks both real-world changes and database corrections
--- ============================================================
-
-CREATE TABLE dim_employee_bitemporal (
-    employee_sk         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    
-    -- Natural key
-    employee_id         INT            NOT NULL,
-    
-    -- Attributes
-    employee_name       VARCHAR(300)   NOT NULL,
-    department          VARCHAR(100),
-    job_title           VARCHAR(200),
-    salary              DECIMAL(12,2),
-    office_location     VARCHAR(100),
-    manager_id          INT,
-    cost_center         VARCHAR(20),
-    
-    -- VALID TIME
-    valid_from          DATE           NOT NULL,
-    valid_to            DATE           NOT NULL DEFAULT '9999-12-31',
-    
-    -- TRANSACTION TIME
-    txn_from            TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    txn_to              TIMESTAMP      NOT NULL DEFAULT '9999-12-31 23:59:59',
-    
-    -- Change tracking
-    change_type         VARCHAR(20),  -- HIRE, TRANSFER, PROMOTION, CORRECTION, TERMINATION
-    change_source       VARCHAR(50)   -- HR_SYSTEM, MANUAL, PAYROLL_FEED
-);
-
-CREATE INDEX idx_emp_bt_nk ON dim_employee_bitemporal(employee_id, valid_from, txn_from);
-CREATE INDEX idx_emp_bt_current ON dim_employee_bitemporal(employee_id) 
-    WHERE valid_to = '9999-12-31' AND txn_to = '9999-12-31 23:59:59';
-```
-
----
-
-## Sequence Diagram — Correction Flow (Bitemporal)
-
-This shows what happens when a trade is corrected after initial recording:
-
-```mermaid
-sequenceDiagram
-    participant TR as Trader
-    participant FO as Front Office
-    participant DB as Bitemporal DB
-    participant AUD as Audit Trail
-    
-    Note over TR,AUD: Day 1: Original trade entry
-    TR->>FO: Execute trade T-1001<br/>100 shares AAPL @ $150<br/>Trade date: Jan 15
-    FO->>DB: INSERT trade T-1001<br/>valid_from=Jan 15, valid_to=9999<br/>txn_from=Jan 15 09:30, txn_to=9999
-    DB->>AUD: Version 1 recorded
-    
-    Note over TR,AUD: Day 5: Correction discovered
-    TR->>FO: Correction: price was $151, not $150
-    FO->>DB: UPDATE existing row:<br/>SET txn_to = Jan 20 14:00<br/>(close old transaction-time version)
-    FO->>DB: INSERT corrected row:<br/>price=$151<br/>valid_from=Jan 15 (unchanged)<br/>txn_from=Jan 20 14:00, txn_to=9999
-    DB->>AUD: Version 2 recorded<br/>Original version preserved
-    
-    Note over TR,AUD: Both versions exist in DB
-    Note over DB: Query "as known today" → returns $151
-    Note over DB: Query "as known on Jan 18" → returns $150
-```
-
----
 
 ## State Machine — Bitemporal Record Lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: INSERT<br/>valid_to=9999, txn_to=9999
+    state "Active" as A
+    state "Superseded (tx_to set)" as S
+    state "Corrected (valid_time adjusted)" as C
     
-    Active --> Superseded_Valid: Real-world change<br/>(e.g., employee transferred)<br/>Close valid_to, insert new version
-    Active --> Superseded_Txn: Correction/Amendment<br/>Close txn_to, insert corrected version
-    Active --> Superseded_Both: Retroactive correction<br/>of a past-dated change
-    Active --> Logically_Deleted: Business cancellation<br/>Close valid_to to cancellation date
-    
-    Superseded_Valid --> [*]: Historical record<br/>(immutable)
-    Superseded_Txn --> [*]: Audit record<br/>(immutable)
-    Superseded_Both --> [*]: Audit record<br/>(immutable)
-    Logically_Deleted --> Superseded_Txn: Correction to deletion<br/>Close txn_to, insert new version
-    
-    note right of Active
-        is_current_valid = true
-        is_current_txn = true
-    end note
-    
-    note right of Superseded_Txn
-        Preserves what the DB
-        believed at a past point
-    end note
+    [*] --> A: INSERT (tx_from=NOW, tx_to=∞)
+    A --> S: New version arrives<br/>(set tx_to=NOW on old row,<br/>INSERT new row with tx_from=NOW)
+    A --> C: Retroactive correction<br/>(set tx_to=NOW on old row,<br/>INSERT corrected row with<br/>different valid_from/valid_to)
+    S --> S: Already superseded (no change)
+    C --> S: Further correction supersedes
 ```
 
----
+## Walkthrough — Late-Arriving Data Scenario
 
-## Data Flow Diagram — Bitemporal ETL Pipeline
+### Scenario
+
+- **Jan 15**: Employee moves from Seattle to Portland (real world)
+- **Feb 3**: HR enters the change in the system (late by 19 days)
+- **Mar 10**: Auditor asks "What address did we have for this employee on Jan 20?"
+
+### Data Evolution
+
+```
+Step 1: Initial record (loaded Dec 1, 2024)
+┌─────────────┬─────────┬────────────┬────────────┬───────────┬───────────┐
+│ employee_id │ city    │ valid_from │ valid_to   │ tx_from   │ tx_to     │
+├─────────────┼─────────┼────────────┼────────────┼───────────┼───────────┤
+│ 1001        │ Seattle │ 2020-01-01 │ 9999-12-31 │ 2024-12-01│ 9999-12-31│
+└─────────────┴─────────┴────────────┴────────────┴───────────┴───────────┘
+
+Step 2: HR enters move on Feb 3 (valid_from=Jan 15, tx_from=Feb 3)
+┌─────────────┬─────────┬────────────┬────────────┬───────────┬───────────┐
+│ employee_id │ city    │ valid_from │ valid_to   │ tx_from   │ tx_to     │
+├─────────────┼─────────┼────────────┼────────────┼───────────┼───────────┤
+│ 1001        │ Seattle │ 2020-01-01 │ 9999-12-31 │ 2024-12-01│ 2025-02-03│  ← closed
+│ 1001        │ Seattle │ 2020-01-01 │ 2025-01-14 │ 2025-02-03│ 9999-12-31│  ← valid until Jan 14
+│ 1001        │ Portland│ 2025-01-15 │ 9999-12-31 │ 2025-02-03│ 9999-12-31│  ← new truth
+└─────────────┴─────────┴────────────┴────────────┴───────────┴───────────┘
+```
+
+### Answering the Auditor's Questions
+
+```sql
+-- Q1: "What was the ACTUAL address on Jan 20?" (valid time query)
+SELECT city FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND valid_from <= '2025-01-20' AND valid_to > '2025-01-20'
+  AND tx_to = '9999-12-31 23:59:59+00';  -- latest knowledge
+-- Result: Portland (the truth)
+
+-- Q2: "What did we BELIEVE the address was on Jan 20?" (transaction time query)
+SELECT city FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND valid_from <= '2025-01-20' AND valid_to > '2025-01-20'
+  AND tx_from <= '2025-01-20' AND tx_to > '2025-01-20';  -- what we knew on Jan 20
+-- Result: Seattle (we hadn't recorded the move yet!)
+
+-- Q3: "What did we know about Jan 20 as of Feb 5?" (full bitemporal)
+SELECT city FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND valid_from <= '2025-01-20' AND valid_to > '2025-01-20'
+  AND tx_from <= '2025-02-05' AND tx_to > '2025-02-05';
+-- Result: Portland (by Feb 5 we had recorded the move)
+```
+
+## Data Flow Diagram
 
 ```mermaid
 flowchart LR
-    subgraph "Source"
-        SRC["Source System<br/>(OLTP)"]
-        LATE["Late Corrections<br/>(manual/file)"]
+    subgraph "Source Event"
+        EV["Employee moves<br/>Jan 15 (real world)"]
     end
     
-    subgraph "Staging"
-        STG["Staging Table<br/>(raw payload + metadata)"]
-        CLASSIFY["Classify Change Type<br/>• New record<br/>• Update to current<br/>• Correction to past<br/>• Late-arriving"]
+    subgraph "System Processing"
+        HR["HR enters change<br/>Feb 3 (19 days late)"]
+        ETL["ETL applies:<br/>1. Close old tx_to<br/>2. Split valid time<br/>3. Insert new version"]
     end
     
-    subgraph "Bitemporal Engine"
-        MATCH["Match on natural key"]
-        NEW["New Record Path<br/>INSERT with valid_from=effective_date"]
-        UPD["Update Path<br/>1. Close current valid_to<br/>2. INSERT new valid version"]
-        CORR["Correction Path<br/>1. Close current txn_to<br/>2. INSERT with same valid_from<br/>   but new txn_from"]
-        LATE_PATH["Late-Arriving Path<br/>1. Split existing valid ranges<br/>2. INSERT backdated version<br/>3. Close txn_to on affected rows"]
+    subgraph "Bitemporal Table"
+        R1["Row 1: Seattle<br/>valid: 2020→Jan14<br/>tx: Dec1→Feb3"]
+        R2["Row 2: Seattle<br/>valid: 2020→Jan14<br/>tx: Feb3→∞"]
+        R3["Row 3: Portland<br/>valid: Jan15→∞<br/>tx: Feb3→∞"]
     end
     
-    subgraph "Bitemporal Store"
-        BT["Bitemporal Table<br/>(all versions preserved)"]
-        VIEW["Current-State View<br/>WHERE valid_to=9999<br/>AND txn_to=9999"]
-    end
-    
-    SRC --> STG
-    LATE --> STG
-    STG --> CLASSIFY
-    CLASSIFY --> MATCH
-    MATCH -->|"Not found"| NEW
-    MATCH -->|"Current change"| UPD
-    MATCH -->|"Correction"| CORR
-    MATCH -->|"Late-arriving"| LATE_PATH
-    NEW --> BT
-    UPD --> BT
-    CORR --> BT
-    LATE_PATH --> BT
-    BT --> VIEW
+    EV -->|"19 day delay"| HR --> ETL --> R1 & R2 & R3
 ```
 
----
+## War Story: Goldman Sachs — Bitemporal Risk Reporting
 
-## The Four Quadrants of Bitemporal Query
+Goldman Sachs uses bitemporal modeling for regulatory risk reporting. When Basel III auditors ask "What was the portfolio risk exposure on March 15, as known on March 20?" — they need the exact data state at both timestamps. Without bitemporality, late-arriving trade corrections would silently change historical risk numbers, violating regulatory immutability requirements.
 
-Every bitemporal query falls into one of four quadrants:
+**Scale**: 500M+ bitemporal rows across trade and position tables, with 4-timestamp queries executed thousands of times daily.
 
-```mermaid
-quadrantChart
-    title Bitemporal Query Quadrants
-    x-axis "Transaction Time (DB Knowledge)" --> "Past" "Current"
-    y-axis "Valid Time (Reality)" --> "Past" "Current"
-    "Current-Current": [0.85, 0.85]
-    "Historical-Current": [0.85, 0.25]
-    "Current-Past Knowledge": [0.25, 0.85]
-    "Full Historical": [0.25, 0.25]
-```
+## Pitfalls
 
-| Quadrant | Query Pattern | Use Case |
-|---|---|---|
-| **Current-Current** | `WHERE valid_to = '9999-12-31' AND txn_to = '9999-12-31'` | Normal operational queries |
-| **Historical valid, Current txn** | `WHERE valid_from <= @date AND valid_to > @date AND txn_to = '9999-12-31'` | "What was true on date X, as we know it now?" |
-| **Current valid, Past txn** | `WHERE valid_to = '9999-12-31' AND txn_from <= @ts AND txn_to > @ts` | "What did we believe was current on timestamp T?" |
-| **Full historical** | `WHERE valid_from <= @date AND valid_to > @date AND txn_from <= @ts AND txn_to > @ts` | "What did we believe was true on date X, as of timestamp T?" |
+| Pitfall | Fix |
+|---|---|
+| Using only valid_time (unitemporal) in a regulated system | Add transaction_time — regulators will ask "what did you know and when?" |
+| Not indexing both time ranges | Create composite indexes on (entity_id, valid_from, valid_to) AND (entity_id, tx_from, tx_to) |
+| Forgetting to close old tx_to when inserting corrections | Every INSERT of a correction must UPDATE tx_to on the superseded row |
+| Using DELETE instead of tx_to closure | Bitemporal NEVER deletes — it closes. Deleting destroys audit trail |
+| Querying without both time predicates | Always include BOTH valid_time AND tx_time predicates, otherwise results are ambiguous |
+
+## Interview
+
+### Q: "Explain the difference between valid time and transaction time."
+
+**Strong Answer**: "Valid time is when a fact was true in the real world — controlled by business events. Transaction time is when the database recorded the fact — controlled by the system. They're independent. An employee may move on January 15 (valid_time), but HR records it on February 3 (transaction_time). Bitemporality tracks both, enabling three distinct queries: what was the truth on date X, what did we believe on date Y, and what did we believe about date X as of date Y."
+
+### Q: "When would you NOT use bitemporal modeling?"
+
+**Strong Answer**: "When (1) late-arriving data doesn't happen or doesn't matter, (2) there's no regulatory/audit requirement, (3) the query complexity and storage overhead aren't justified. Standard SCD Type 2 with effective_from/effective_to covers most analytical use cases. Bitemporality is for regulated industries, financial reporting, and anywhere 'what did we know at the time' matters."
+
+## References
+
+| Resource | Link |
+|---|---|
+| *Developing Time-Oriented Database Applications in SQL* | Richard Snodgrass (1999) |
+| *Temporal Data & The Relational Model* | C.J. Date, Hugh Darwen, Nikos Lorentzos |
+| SQL:2011 Standard | Temporal extensions (SYSTEM_TIME, APPLICATION_TIME) |
+| [PostgreSQL temporal_tables extension](https://github.com/arkhipov/temporal_tables) | Open-source bitemporal support for Postgres |
+| Cross-ref: SCD Extreme Cases | [../../02_Dimensional_Modeling_Advanced/02_SCD_Extreme_Cases](../../02_Dimensional_Modeling_Advanced/02_SCD_Extreme_Cases/) |
+| Cross-ref: As-Of Queries | [../02_As_Of_Queries](../02_As_Of_Queries/) — query patterns for temporal data |

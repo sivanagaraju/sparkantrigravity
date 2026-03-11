@@ -1,348 +1,188 @@
-# Snapshot Fact Tables — How It Works (Deep Internals)
-
-> HLD, ER diagrams, DDL table structures, sequence diagrams, and data flow.
+# Snapshot Fact Tables — How It Works, Examples, Pitfalls, Interview, References
 
 ---
 
-## High-Level Design — Periodic vs Accumulating Snapshots
-
-```mermaid
-flowchart TB
-    subgraph "Periodic Snapshot Architecture"
-        TXN1["Transaction Facts<br/>(every event)"]
-        AGG["Aggregation Job<br/>(Spark/SQL — daily batch)"]
-        PS["Periodic Snapshot<br/>fact_account_daily<br/>One row per account per day"]
-        DIM["Dimensions<br/>(account, product, date)"]
-    end
-    
-    subgraph "Accumulating Snapshot Architecture"
-        TXN2["Transaction Events<br/>(status changes)"]
-        UPSERT["Upsert Job<br/>(match on process key)"]
-        AS["Accumulating Snapshot<br/>fact_order_lifecycle<br/>One row per order"]
-        DIM2["Milestone Dimensions<br/>(date dims for each stage)"]
-    end
-    
-    TXN1 --> AGG --> PS
-    DIM --> PS
-    TXN2 --> UPSERT --> AS
-    DIM2 --> AS
-    
-    style PS fill:#FF6B35,color:#fff
-    style AS fill:#4ECDC4,color:#fff
-```
-
----
-
-## ER Diagram — Periodic Snapshot: Daily Account Balance
+## ER Diagram — Periodic vs Accumulating Snapshot
 
 ```mermaid
 erDiagram
-    FACT_ACCOUNT_DAILY {
-        bigint snapshot_sk PK
+    FACT_DAILY_INVENTORY {
         int date_sk FK "Snapshot date"
-        bigint account_sk FK
-        bigint branch_sk FK
         bigint product_sk FK
-        decimal opening_balance "Semi-additive"
-        decimal closing_balance "Semi-additive"
-        decimal total_credits "Additive"
-        decimal total_debits "Additive"
-        int transaction_count "Additive"
-        decimal avg_daily_balance "Semi-additive"
-        decimal interest_accrued "Additive"
+        bigint warehouse_sk FK
+        int quantity_on_hand "Semi-additive"
+        int quantity_on_order
+        int quantity_reserved
+        decimal inventory_value "Semi-additive"
     }
     
-    DIM_DATE {
-        int date_sk PK
-        date calendar_date
-        int year
-        int quarter
-        int month
-        int day_of_week
-        boolean is_business_day
-        boolean is_month_end
-    }
-    
-    DIM_ACCOUNT {
-        bigint account_sk PK
-        int account_id
-        varchar account_type
-        varchar status
-        date open_date
-        decimal credit_limit
-    }
-    
-    FACT_ACCOUNT_DAILY }o--|| DIM_DATE : "date_sk"
-    FACT_ACCOUNT_DAILY }o--|| DIM_ACCOUNT : "account_sk"
-```
-
-## ER Diagram — Accumulating Snapshot: Order Lifecycle
-
-```mermaid
-erDiagram
-    FACT_ORDER_LIFECYCLE {
+    FACT_ORDER_ACCUMULATING {
         bigint order_sk PK
-        varchar order_number "Degenerate dim"
         bigint customer_sk FK
-        bigint product_sk FK
-        int order_date_sk FK
-        int payment_date_sk FK "NULL until paid"
-        int ship_date_sk FK "NULL until shipped"
-        int delivery_date_sk FK "NULL until delivered"
-        int return_date_sk FK "NULL if not returned"
+        int order_date_sk FK "Milestone 1"
+        int ship_date_sk FK "Milestone 2"
+        int delivery_date_sk FK "Milestone 3"
+        int return_date_sk FK "Milestone 4 (nullable)"
         decimal order_amount
-        decimal shipping_cost
+        int days_to_ship "Derived"
+        int days_to_deliver "Derived"
         varchar current_status
-        int days_to_payment "Computed lag"
-        int days_to_ship "Computed lag"
-        int days_to_deliver "Computed lag"
-        timestamp last_updated
     }
     
-    DIM_DATE {
-        int date_sk PK
-        date calendar_date
-    }
+    DIM_DATE { int date_sk PK }
+    DIM_PRODUCT { bigint product_sk PK }
     
-    DIM_CUSTOMER {
-        bigint customer_sk PK
-        varchar customer_name
-    }
-    
-    FACT_ORDER_LIFECYCLE }o--|| DIM_DATE : "order_date_sk"
-    FACT_ORDER_LIFECYCLE }o--|| DIM_DATE : "ship_date_sk"
-    FACT_ORDER_LIFECYCLE }o--|| DIM_DATE : "delivery_date_sk"
-    FACT_ORDER_LIFECYCLE }o--|| DIM_CUSTOMER : "customer_sk"
+    FACT_DAILY_INVENTORY }o--|| DIM_DATE : ""
+    FACT_DAILY_INVENTORY }o--|| DIM_PRODUCT : ""
+    FACT_ORDER_ACCUMULATING }o--|| DIM_DATE : "order_date"
+    FACT_ORDER_ACCUMULATING }o--|| DIM_DATE : "ship_date"
+    FACT_ORDER_ACCUMULATING }o--|| DIM_DATE : "delivery_date"
 ```
 
----
-
-## Table Structures
-
-### Periodic Snapshot — Daily Account Balance
+## DDL — Periodic Snapshot
 
 ```sql
 -- ============================================================
--- Periodic snapshot: one row per account per day
--- Semi-additive measures: can SUM across accounts, NOT across days
+-- PERIODIC SNAPSHOT: one row per product per warehouse per day
+-- Grain: product × warehouse × day
 -- ============================================================
 
-CREATE TABLE fact_account_daily (
-    snapshot_sk         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+CREATE TABLE fact_daily_inventory (
+    date_sk             INT         NOT NULL REFERENCES dim_date(date_sk),
+    product_sk          BIGINT      NOT NULL REFERENCES dim_product(product_sk),
+    warehouse_sk        BIGINT      NOT NULL REFERENCES dim_warehouse(warehouse_sk),
     
-    -- Grain: account + date
-    date_sk             INT            NOT NULL REFERENCES dim_date(date_sk),
-    account_sk          BIGINT         NOT NULL REFERENCES dim_account(account_sk),
+    -- Semi-additive measures (DO NOT SUM across time!)
+    quantity_on_hand    INT         NOT NULL,
+    quantity_on_order   INT         DEFAULT 0,
+    quantity_reserved   INT         DEFAULT 0,
+    inventory_value     DECIMAL(15,2) NOT NULL,
     
-    -- Dimension FKs
-    branch_sk           BIGINT         REFERENCES dim_branch(branch_sk),
-    product_sk          BIGINT         REFERENCES dim_product(product_sk),
+    -- Row count for correct averaging
+    row_count           INT         DEFAULT 1,
     
-    -- Semi-additive measures (DO NOT SUM across time)
-    opening_balance     DECIMAL(18,2)  NOT NULL,
-    closing_balance     DECIMAL(18,2)  NOT NULL,
-    avg_daily_balance   DECIMAL(18,2),
-    
-    -- Fully additive measures (CAN SUM across time and other dims)
-    total_credits       DECIMAL(18,2)  DEFAULT 0,
-    total_debits        DECIMAL(18,2)  DEFAULT 0,
-    transaction_count   INT            DEFAULT 0,
-    interest_accrued    DECIMAL(12,4)  DEFAULT 0,
-    
-    -- Metadata
-    snapshot_date       DATE           NOT NULL,
-    loaded_at           TIMESTAMP      DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Uniqueness constraint on grain
-    CONSTRAINT uq_account_daily UNIQUE (date_sk, account_sk)
-    
-) PARTITION BY RANGE (snapshot_date);
+    PRIMARY KEY (date_sk, product_sk, warehouse_sk)
+) PARTITION BY RANGE (date_sk);
 
--- Create monthly partitions
-CREATE TABLE fact_account_daily_2024_01 PARTITION OF fact_account_daily
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE fact_account_daily_2024_02 PARTITION OF fact_account_daily
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
--- ... repeat per month
-
--- Indexes
-CREATE INDEX idx_fad_account ON fact_account_daily(account_sk, snapshot_date);
-CREATE INDEX idx_fad_date ON fact_account_daily(date_sk);
-```
-
-### Accumulating Snapshot — Order Lifecycle
-
-```sql
 -- ============================================================
--- Accumulating snapshot: one row per order, updated at each milestone
--- Multiple date FKs, lag measures computed on each update
+-- ACCUMULATING SNAPSHOT: one row per order, updated at milestones
 -- ============================================================
 
-CREATE TABLE fact_order_lifecycle (
-    order_sk            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+CREATE TABLE fact_order_pipeline (
+    order_sk            BIGINT      PRIMARY KEY,
+    customer_sk         BIGINT      NOT NULL,
+    product_sk          BIGINT      NOT NULL,
     
-    -- Process instance key
-    order_number        VARCHAR(30)    NOT NULL UNIQUE,  -- degenerate dim
+    -- Multiple date FKs — one per milestone
+    order_date_sk       INT         NOT NULL,  -- always filled
+    payment_date_sk     INT,                    -- filled when paid
+    ship_date_sk        INT,                    -- filled when shipped
+    delivery_date_sk    INT,                    -- filled when delivered
+    return_date_sk      INT,                    -- filled if returned
     
-    -- Entity dimensions
-    customer_sk         BIGINT         NOT NULL REFERENCES dim_customer(customer_sk),
-    product_sk          BIGINT         NOT NULL REFERENCES dim_product(product_sk),
-    channel_sk          BIGINT         REFERENCES dim_channel(channel_sk),
-    
-    -- Milestone date dimensions (NULL until milestone is reached)
-    order_date_sk       INT            NOT NULL REFERENCES dim_date(date_sk),
-    payment_date_sk     INT            REFERENCES dim_date(date_sk),
-    pick_date_sk        INT            REFERENCES dim_date(date_sk),
-    ship_date_sk        INT            REFERENCES dim_date(date_sk),
-    delivery_date_sk    INT            REFERENCES dim_date(date_sk),
-    return_date_sk      INT            REFERENCES dim_date(date_sk),
-    
-    -- Measures
-    order_amount        DECIMAL(12,2)  NOT NULL,
-    shipping_cost       DECIMAL(10,2)  DEFAULT 0,
-    discount_amount     DECIMAL(10,2)  DEFAULT 0,
-    return_amount       DECIMAL(12,2)  DEFAULT 0,
-    
-    -- Status
-    current_status      VARCHAR(20)    NOT NULL,  -- ORDERED, PAID, PICKED, SHIPPED, DELIVERED, RETURNED
-    
-    -- Computed lags (days between milestones)
+    -- Derived lag measures
     days_order_to_payment   INT,
     days_payment_to_ship    INT,
     days_ship_to_delivery   INT,
-    days_order_to_delivery  INT,
     
-    -- Metadata
-    last_updated        TIMESTAMP      DEFAULT CURRENT_TIMESTAMP
+    order_amount        DECIMAL(12,2),
+    current_status      VARCHAR(20),   -- ORDERED, PAID, SHIPPED, DELIVERED, RETURNED
+    
+    last_updated        TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE INDEX idx_fol_status ON fact_order_lifecycle(current_status);
-CREATE INDEX idx_fol_order_date ON fact_order_lifecycle(order_date_sk);
 ```
 
----
+## Semi-Additive Aggregation — The Critical Rule
 
-## Sequence Diagram — Periodic Snapshot Generation
+```sql
+-- ============================================================
+-- WRONG: SUM of balances across time = nonsensical number
+-- ============================================================
+SELECT SUM(inventory_value)  -- WRONG!
+FROM fact_daily_inventory
+WHERE date_sk BETWEEN 20250101 AND 20250131;
+-- This sums 31 days of inventory = 31x the actual value
+
+-- ============================================================
+-- RIGHT: Use the LAST day of the period, or AVERAGE
+-- ============================================================
+
+-- Option 1: End-of-period snapshot
+SELECT warehouse_sk, SUM(inventory_value) AS total_inventory
+FROM fact_daily_inventory
+WHERE date_sk = 20250131  -- last day of January
+GROUP BY warehouse_sk;
+
+-- Option 2: Average daily inventory
+SELECT warehouse_sk, AVG(inventory_value) AS avg_inventory
+FROM fact_daily_inventory
+WHERE date_sk BETWEEN 20250101 AND 20250131
+GROUP BY warehouse_sk;
+
+-- Option 3: SUM across non-time dimensions (this IS correct)
+SELECT date_sk, SUM(inventory_value) AS total_across_warehouses
+FROM fact_daily_inventory
+WHERE date_sk = 20250131
+GROUP BY date_sk;  -- SUM across warehouses on a single day = correct
+```
+
+## Accumulating Snapshot — State Machine
 
 ```mermaid
-sequenceDiagram
-    participant SCH as Scheduler (Airflow)
-    participant SPARK as Spark Job
-    participant TXN as fact_transactions
-    participant PREV as Previous Day Snapshot
-    participant SNAP as fact_account_daily
-    participant QA as Quality Check
+stateDiagram-v2
+    [*] --> Ordered: order_date_sk filled
+    Ordered --> Paid: payment_date_sk filled
+    Paid --> Shipped: ship_date_sk filled
+    Shipped --> Delivered: delivery_date_sk filled
+    Delivered --> Returned: return_date_sk filled (if returned)
+    Delivered --> [*]: Complete
+    Returned --> [*]: Complete
     
-    SCH->>SPARK: Trigger daily snapshot job (T+1)
-    SPARK->>PREV: Read previous day closing balances
-    SPARK->>TXN: Read today's transactions<br/>(credits, debits, count)
-    SPARK->>SPARK: Compute:<br/>opening_balance = prev.closing_balance<br/>closing_balance = opening + credits - debits<br/>avg_balance = (opening + closing) / 2
-    SPARK->>SNAP: INSERT INTO fact_account_daily<br/>(one row per account)
-    SNAP->>QA: Validate:<br/>1. Row count = expected accounts<br/>2. SUM(closing) reconciles with GL<br/>3. No NULLs in required fields
-    QA->>SCH: Pass/Fail
+    note right of Paid
+        days_order_to_payment = 
+        payment_date - order_date
+    end note
     
-    Note over SPARK: Dense snapshot: creates a row<br/>for every active account,<br/>even if no transactions today
+    note right of Delivered
+        days_ship_to_delivery = 
+        delivery_date - ship_date
+    end note
 ```
 
----
+## War Story: Amazon — Daily Inventory Snapshots
 
-## Sequence Diagram — Accumulating Snapshot Update
+Amazon's `fact_daily_inventory` captures inventory state for every product × fulfillment center × day. At 500M products × 200 fulfillment centers, this generates **100B rows per year**. Key design decisions:
 
-```mermaid
-sequenceDiagram
-    participant EVENT as Status Change Event
-    participant ETL as ETL Pipeline
-    participant SNAP as fact_order_lifecycle
-    
-    Note over EVENT,SNAP: Phase 1: Order Created
-    EVENT->>ETL: Order ORD-1001 created
-    ETL->>SNAP: INSERT new row<br/>order_date_sk = 20240315<br/>status = ORDERED<br/>All other date_sk = NULL
-    
-    Note over EVENT,SNAP: Phase 2: Payment Received
-    EVENT->>ETL: ORD-1001 payment received
-    ETL->>SNAP: UPDATE SET<br/>payment_date_sk = 20240316<br/>status = PAID<br/>days_order_to_payment = 1
-    
-    Note over EVENT,SNAP: Phase 3: Shipped
-    EVENT->>ETL: ORD-1001 shipped
-    ETL->>SNAP: UPDATE SET<br/>ship_date_sk = 20240318<br/>status = SHIPPED<br/>days_payment_to_ship = 2
-    
-    Note over EVENT,SNAP: Phase 4: Delivered
-    EVENT->>ETL: ORD-1001 delivered
-    ETL->>SNAP: UPDATE SET<br/>delivery_date_sk = 20240321<br/>status = DELIVERED<br/>days_ship_to_delivery = 3<br/>days_order_to_delivery = 6
-```
+- Partitioned by `date_sk` (daily partitions for efficient pruning)
+- Compressed with columnar encoding (Redshift AZ64)
+- Semi-additive measures clearly documented — SUM is ONLY correct across product/warehouse, NEVER across time
+- Retention: 3 years of daily, then aggregated to weekly for older data
 
----
+## Pitfalls
 
-## Data Flow Diagram — Snapshot Pipeline
+| Pitfall | Fix |
+|---|---|
+| Summing semi-additive measures across time | Use AVG or end-of-period value. Document which measures are semi-additive |
+| Not building the snapshot daily | Missing days create gaps in trend analysis. Build even on weekends/holidays |
+| Accumulating snapshot never updated | Set up milestone-triggered ETL. Don't rely on batch — use CDC for milestones |
+| Snapshot table growing unbounded | Partition and implement retention policy: daily→weekly→monthly rollup |
 
-```mermaid
-flowchart LR
-    subgraph "Sources"
-        OLTP["OLTP Systems"]
-        CDC["CDC Events"]
-        GL["General Ledger"]
-    end
-    
-    subgraph "Transaction Layer"
-        TXN["Transaction Fact Table<br/>(finest grain events)"]
-    end
-    
-    subgraph "Snapshot Generation"
-        PREV["Previous Period Snapshot<br/>(T-1 closing state)"]
-        CALC["Compute New Snapshot:<br/>• Opening = prev closing<br/>• Credits/Debits from txns<br/>• Closing = opening + net<br/>• Avg = (open + close) / 2"]
-        QA["Quality Checks:<br/>• Row count validation<br/>• Balance reconciliation<br/>• Completeness check"]
-    end
-    
-    subgraph "Snapshot Store"
-        SNAP["Periodic Snapshot Fact<br/>(partitioned by date)"]
-        DENSE["Dense: every entity every period"]
-    end
-    
-    subgraph "Consumers"
-        BI["BI Reports<br/>(balance trends)"]
-        REG["Regulatory<br/>(period-end state)"]
-        RECON["Reconciliation<br/>(txn ↔ snapshot)"]
-    end
-    
-    OLTP --> CDC --> TXN
-    GL --> TXN
-    TXN --> CALC
-    PREV --> CALC
-    CALC --> QA --> SNAP
-    SNAP --> DENSE
-    SNAP --> BI
-    SNAP --> REG
-    TXN --> RECON
-    SNAP --> RECON
-```
+## Interview
 
----
+### Q: "How would you track inventory levels in a DW?"
 
-## Activity Diagram — Semi-Additive Measure Handling
+**Strong Answer**: "Periodic snapshot fact table. Grain is product × warehouse × day. Every night, ETL captures the current inventory state and inserts one row per product-warehouse. The measures (quantity_on_hand, inventory_value) are semi-additive — they can be summed across products and warehouses but NOT across time. For monthly reports, I'd use the last-day-of-month snapshot or an average."
 
-```mermaid
-flowchart TD
-    START([BI user writes query])
-    
-    START --> Q1{What measure type?}
-    
-    Q1 -->|Fully additive| ADD["SUM across all dimensions<br/>(transaction_count, total_credits)"]
-    Q1 -->|Semi-additive| SEMI{"Dimension being aggregated?"}
-    
-    SEMI -->|"Across accounts (non-time)"| SUM_OK["SUM is valid<br/>Total closing balance across all accounts"]
-    SEMI -->|"Across time"| SUM_BAD["⚠️ SUM is INVALID<br/>Cannot sum daily balances"]
-    
-    SUM_BAD --> ALT{"What to use instead?"}
-    ALT -->|Period-end| LAST["Use closing_balance WHERE<br/>date = period_end_date"]
-    ALT -->|Average| AVG["Use AVG(closing_balance)<br/>across the period"]
-    ALT -->|Weighted avg| WAVG["Use SUM(balance × days_held)<br/>÷ total_days"]
-    
-    ADD --> RESULT([Return result])
-    SUM_OK --> RESULT
-    LAST --> RESULT
-    AVG --> RESULT
-    WAVG --> RESULT
-    
-    style SUM_BAD fill:#E74C3C,color:#fff
-    style SUM_OK fill:#27AE60,color:#fff
-```
+### Q: "What's the difference between a transaction fact and a snapshot fact?"
+
+**Strong Answer**: "A transaction fact records events (one row per sale, one row per click). Measures are fully additive — SUM revenue across any dimension is correct. A snapshot fact records state at a point in time (one row per account per day). Measures are semi-additive — you can SUM across accounts but not across dates. You'd use AVG(balance) for a time-range aggregate."
+
+## References
+
+| Resource | Link |
+|---|---|
+| *The Data Warehouse Toolkit* 3rd Ed. | Ch. 4: Inventory — periodic snapshots |
+| *The Data Warehouse Toolkit* 3rd Ed. | Ch. 7: Accumulating Snapshots |
+| [dbt snapshots](https://docs.getdbt.com/docs/build/snapshots) | SCD2 snapshot strategy in dbt |
+| Cross-ref: Valid vs Tx Time | [../01_Valid_vs_Transaction_Time](../01_Valid_vs_Transaction_Time/) — temporal foundation |
+| Cross-ref: Aggregate Tables | [../../02_Dimensional_Modeling_Advanced/05_Aggregate_Tables](../../02_Dimensional_Modeling_Advanced/05_Aggregate_Tables/) — rollup strategies |

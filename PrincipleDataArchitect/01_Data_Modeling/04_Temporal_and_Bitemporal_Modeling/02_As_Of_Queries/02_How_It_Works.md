@@ -1,317 +1,136 @@
-# As-Of Queries — How It Works (Deep Internals)
-
-> HLD, sequence diagrams, DDL, query patterns, and execution mechanics.
+# As-Of Queries — How It Works, Examples, Pitfalls, Interview, References
 
 ---
 
-## High-Level Design — As-Of Query Infrastructure
+## The Four Query Patterns
 
-```mermaid
-flowchart TB
-    subgraph "Query Layer"
-        APP["Application / BI Tool"]
-        QP["Query Parser<br/>(intercepts temporal clauses)"]
-        QR["Query Rewriter<br/>(adds temporal predicates)"]
-    end
-    
-    subgraph "Storage Layer"
-        CUR["Current-State Table<br/>(or materialized view)"]
-        HIST["History Table<br/>(system-versioned or bitemporal)"]
-        SNAP["Pre-Computed Snapshots<br/>(month-end, quarter-end)"]
-    end
-    
-    subgraph "Index Layer"
-        IDX_CUR["B-tree on PK<br/>(current state fast path)"]
-        IDX_TEMP["GiST / Composite<br/>(temporal range lookups)"]
-        IDX_SNAP["Partition pruning<br/>(snapshot date)"]
-    end
-    
-    APP --> QP --> QR
-    QR -->|"No temporal clause"| CUR --> IDX_CUR
-    QR -->|"AS OF timestamp"| HIST --> IDX_TEMP
-    QR -->|"Pre-computed date"| SNAP --> IDX_SNAP
-    
-    style QR fill:#FF6B35,color:#fff
+### Pattern 1: Current State (non-temporal equivalent)
+
+```sql
+-- What is the employee's CURRENT city?
+SELECT employee_id, city
+FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND tx_to = '9999-12-31 23:59:59+00'    -- latest knowledge
+  AND valid_to = '9999-12-31';              -- currently valid
 ```
 
----
+### Pattern 2: Valid-Time As-Of
 
-## Sequence Diagram — SQL Server SYSTEM_TIME As-Of Query
+```sql
+-- What was the employee's city on January 20, 2025?
+-- (using latest knowledge — corrections applied)
+SELECT employee_id, city, valid_from, valid_to
+FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND valid_from <= '2025-01-20'
+  AND valid_to   >  '2025-01-20'
+  AND tx_to = '9999-12-31 23:59:59+00';  -- latest transaction version
+```
+
+### Pattern 3: Transaction-Time As-Of
+
+```sql
+-- What did we BELIEVE the employee's city was on January 25?
+-- (before the Feb 3 correction arrived)
+SELECT employee_id, city, tx_from, tx_to
+FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND tx_from <= '2025-01-25'
+  AND tx_to   >  '2025-01-25'
+  AND valid_from <= '2025-01-25'
+  AND valid_to   >  '2025-01-25';
+-- Result: Seattle (the correction hadn't been entered yet)
+```
+
+### Pattern 4: Full Bitemporal As-Of
+
+```sql
+-- What did we know about Jan 20 as of Feb 5?
+SELECT employee_id, city
+FROM employee_bitemporal
+WHERE employee_id = 1001
+  AND valid_from <= '2025-01-20'   -- valid time target
+  AND valid_to   >  '2025-01-20'
+  AND tx_from    <= '2025-02-05'   -- knowledge time target
+  AND tx_to      >  '2025-02-05';
+-- Result: Portland (by Feb 5 the correction was recorded)
+```
+
+## Sequence Diagram — Query Execution
 
 ```mermaid
 sequenceDiagram
     participant User as Analyst
-    participant QE as SQL Server Engine
-    participant CURR as dbo.Policy (current)
-    participant HIST as dbo.PolicyHistory (history)
+    participant Q as Query Engine
+    participant BT as employee_bitemporal
     
-    User->>QE: SELECT * FROM dbo.Policy<br/>FOR SYSTEM_TIME AS OF '2024-03-15'
-    QE->>QE: Parse temporal clause<br/>Rewrite to UNION query
-    QE->>CURR: Scan current table<br/>WHERE sys_start <= '2024-03-15'<br/>AND sys_end > '2024-03-15'
-    QE->>HIST: Scan history table<br/>WHERE sys_start <= '2024-03-15'<br/>AND sys_end > '2024-03-15'
-    QE->>QE: UNION results<br/>Deduplicate by PK
-    QE->>User: Return point-in-time resultset
+    User->>Q: "What was HR's view on Jan 25<br/>about employee 1001's address?"
+    Q->>BT: WHERE employee_id=1001<br/>AND valid_from<=Jan20 AND valid_to>Jan20<br/>AND tx_from<=Jan25 AND tx_to>Jan25
+    BT-->>Q: Row: Seattle<br/>(correction not yet recorded)
+    Q-->>User: Result: Seattle
     
-    Note over QE: Engine automatically queries<br/>both current + history tables<br/>and merges results
+    User->>Q: "Same question, but as of Feb 5?"
+    Q->>BT: AND tx_from<=Feb5 AND tx_to>Feb5
+    BT-->>Q: Row: Portland<br/>(correction was recorded Feb 3)
+    Q-->>User: Result: Portland
 ```
 
----
-
-## Sequence Diagram — Delta Lake Time Travel
-
-```mermaid
-sequenceDiagram
-    participant User as Spark Job
-    participant DELTA as Delta Lake Engine
-    participant LOG as Transaction Log (_delta_log/)
-    participant PARQ as Parquet Files
-    
-    User->>DELTA: spark.read.format("delta")<br/>.option("timestampAsOf", "2024-03-15")<br/>.load("/data/trades")
-    DELTA->>LOG: Read _delta_log/*.json<br/>Find latest commit <= 2024-03-15
-    LOG->>DELTA: Return commit version 147<br/>(committed at 2024-03-14 23:45:00)
-    DELTA->>LOG: Read commit 147 manifest<br/>Get list of active Parquet files
-    DELTA->>PARQ: Read only files listed in commit 147<br/>(ignores files added after)
-    PARQ->>DELTA: Return data
-    DELTA->>User: Return DataFrame<br/>(state as of commit 147)
-    
-    Note over DELTA: No data copying.<br/>Just reads different file manifest.<br/>O(1) metadata lookup.
-```
-
----
-
-## Table Structures
-
-### System-Versioned Temporal Table (SQL Server)
+## Temporal Join — Two Bitemporal Tables
 
 ```sql
--- ============================================================
--- SQL Server system-versioned temporal table
--- Transaction time is managed automatically by the engine
--- ============================================================
-
-CREATE TABLE dbo.Portfolio (
-    portfolio_id        INT            NOT NULL PRIMARY KEY,
-    portfolio_name      VARCHAR(200)   NOT NULL,
-    manager_id          INT            NOT NULL,
-    strategy            VARCHAR(100),
-    aum                 DECIMAL(18,2), -- assets under management
-    risk_rating         VARCHAR(10),
-    benchmark           VARCHAR(50),
-    
-    -- System-managed temporal columns
-    sys_start           DATETIME2 GENERATED ALWAYS AS ROW START HIDDEN NOT NULL,
-    sys_end             DATETIME2 GENERATED ALWAYS AS ROW END HIDDEN NOT NULL,
-    PERIOD FOR SYSTEM_TIME (sys_start, sys_end)
-)
-WITH (SYSTEM_VERSIONING = ON (
-    HISTORY_TABLE = dbo.PortfolioHistory,
-    DATA_CONSISTENCY_CHECK = ON
-));
-
--- Clustered columnstore index on history table for fast as-of scans
-CREATE CLUSTERED COLUMNSTORE INDEX cci_portfolio_history
-    ON dbo.PortfolioHistory;
+-- Join employee to department WHERE valid times overlap
+SELECT 
+    e.employee_name,
+    d.department_name,
+    GREATEST(e.valid_from, d.valid_from) AS overlap_start,
+    LEAST(e.valid_to, d.valid_to)        AS overlap_end
+FROM employee_bitemporal e
+JOIN department_bitemporal d 
+    ON e.department_id = d.department_id
+    AND e.valid_from < d.valid_to       -- overlap condition
+    AND e.valid_to   > d.valid_from     -- overlap condition
+WHERE e.tx_to = '9999-12-31 23:59:59+00'
+  AND d.tx_to = '9999-12-31 23:59:59+00';
 ```
 
-### Manual Bitemporal As-Of Support (PostgreSQL)
+## Snowflake Time Travel (Built-in As-Of)
 
 ```sql
--- ============================================================
--- PostgreSQL: manual bitemporal table with range types
--- As-of queries use range containment operators
--- ============================================================
+-- Snowflake: automatic transaction-time as-of
+SELECT * FROM employee 
+AT(TIMESTAMP => '2025-01-25 10:00:00'::TIMESTAMP);
 
-CREATE TABLE position_bitemporal (
-    position_sk         BIGSERIAL PRIMARY KEY,
-    account_id          INT            NOT NULL,
-    instrument_id       VARCHAR(20)    NOT NULL,
-    quantity            DECIMAL(18,4)  NOT NULL,
-    market_value        DECIMAL(20,2),
-    
-    -- Valid time: when was this position state true?
-    valid_range         DATERANGE      NOT NULL,
-    
-    -- Transaction time: when did the system record this?
-    txn_range           TSTZRANGE      NOT NULL 
-                        DEFAULT tstzrange(CURRENT_TIMESTAMP, 'infinity'),
-    
-    -- Prevent overlapping versions
-    EXCLUDE USING GIST (
-        account_id WITH =,
-        instrument_id WITH =,
-        valid_range WITH &&,
-        txn_range WITH &&
-    )
-);
-
--- Indexes for as-of query performance
-CREATE INDEX idx_pos_bt_valid ON position_bitemporal USING GIST (valid_range);
-CREATE INDEX idx_pos_bt_txn ON position_bitemporal USING GIST (txn_range);
-CREATE INDEX idx_pos_bt_nk ON position_bitemporal(account_id, instrument_id);
+-- BigQuery: similar feature
+SELECT * FROM `project.dataset.employee`
+FOR SYSTEM_TIME AS OF '2025-01-25 10:00:00+00:00';
 ```
 
----
+## War Story: JPMorgan — Regulatory As-Of Reporting
 
-## As-Of Query Patterns — All Three Types
+JPMorgan uses as-of queries for Basel III regulatory reporting. Regulators require: "What was the portfolio composition on December 31, as known on January 15 (submission deadline)?" This is a full bitemporal query. Late-arriving trade corrections after January 15 must NOT change the December 31 report. The transaction_time filter ensures immutability of submitted reports.
 
-### 1. Transaction-Time As-Of: "What did the DB know at time T?"
+## Pitfalls
 
-```sql
--- SQL Server (native)
-SELECT portfolio_id, portfolio_name, aum, risk_rating
-FROM dbo.Portfolio
-FOR SYSTEM_TIME AS OF '2024-03-15 18:00:00';
+| Pitfall | Fix |
+|---|---|
+| Forgetting tx_to predicate (returning all versions) | Always include `AND tx_to > :as_of_date` — otherwise you get superseded rows |
+| Using `=` instead of range overlap | Use `start <= X AND end > X`, never `start = X` — time ranges are intervals |
+| Not indexing time columns | Create composite indexes: (entity_id, valid_from, valid_to) and (entity_id, tx_from, tx_to) |
+| Performance on large temporal tables | Partition by valid_from month; consider materialized PIT snapshots |
 
--- PostgreSQL (manual bitemporal)
-SELECT account_id, instrument_id, quantity, market_value
-FROM position_bitemporal
-WHERE txn_range @> '2024-03-15 18:00:00'::timestamptz
-  AND upper(valid_range) = 'infinity';  -- current valid state at that txn time
+## Interview
 
--- Delta Lake (Spark)
--- SELECT * FROM delta.`/data/positions` TIMESTAMP AS OF '2024-03-15';
-```
+### Q: "How do you handle late-arriving data in a DW?"
 
-### 2. Valid-Time As-Of: "What was true on date D?"
+**Strong Answer**: "Bitemporal modeling. The valid_time captures when the fact was true in reality (potentially in the past), and the transaction_time captures when we learned about it. A late-arriving correction inserts a new row with backdated valid_from but current tx_from. This preserves both the corrected truth AND the historical knowledge state. As-of queries with both time filters let me answer 'what did we know at the time' vs 'what do we know now.'"
 
-```sql
--- PostgreSQL (manual bitemporal)
-SELECT account_id, instrument_id, quantity, market_value
-FROM position_bitemporal
-WHERE valid_range @> '2024-06-30'::date
-  AND upper(txn_range) = 'infinity';  -- latest system knowledge
+## References
 
--- Equivalent with standard columns (non-range)
-SELECT account_id, instrument_id, quantity, market_value
-FROM position_standard
-WHERE valid_from <= '2024-06-30'
-  AND valid_to > '2024-06-30'
-  AND txn_to = '9999-12-31 23:59:59';
-```
-
-### 3. Cross-Time As-Of: "What did we believe about date D at time T?"
-
-```sql
--- The full bitemporal query: both axes
-SELECT account_id, instrument_id, quantity, market_value
-FROM position_bitemporal
-WHERE valid_range @> '2024-06-30'::date           -- valid on June 30
-  AND txn_range @> '2024-07-15 09:00:00'::timestamptz;  -- as known on July 15
-
--- This returns what the system believed the June 30 position was,
--- based on information available by July 15.
--- If a correction arrived on July 20, this query will NOT see it.
-```
-
----
-
-## State Machine — As-Of Query Resolution
-
-```mermaid
-stateDiagram-v2
-    [*] --> ParseQuery: Receive SQL
-    
-    ParseQuery --> NoTemporalClause: No temporal keywords
-    ParseQuery --> HasTemporalClause: FOR SYSTEM_TIME / temporal predicate
-    
-    NoTemporalClause --> CurrentStateTable: Route to current-state view/table
-    
-    HasTemporalClause --> IdentifyAxes: Determine which time axis
-    
-    IdentifyAxes --> TxnTimeOnly: Transaction time only
-    IdentifyAxes --> ValidTimeOnly: Valid time only
-    IdentifyAxes --> BothAxes: Both axes specified
-    
-    TxnTimeOnly --> CheckSnapshot: Check pre-computed snapshots
-    ValidTimeOnly --> QueryBitemporal: Add valid_range predicate
-    BothAxes --> QueryBitemporal: Add both predicates
-    
-    CheckSnapshot --> SnapshotHit: Snapshot exists for date
-    CheckSnapshot --> SnapshotMiss: No pre-computed snapshot
-    
-    SnapshotHit --> ReturnResult: Return from snapshot (fast)
-    SnapshotMiss --> QueryBitemporal: Fall back to base table
-    
-    QueryBitemporal --> ApplyIndexes: Use GiST/composite index
-    ApplyIndexes --> ReturnResult: Return filtered results
-    
-    CurrentStateTable --> ReturnResult: Return current state
-    ReturnResult --> [*]
-```
-
----
-
-## Data Flow Diagram — As-Of Query in a Data Platform
-
-```mermaid
-flowchart LR
-    subgraph "Query Sources"
-        BI["BI Dashboard<br/>(current state)"]
-        REG["Regulatory Report<br/>(as-of specific date)"]
-        ML["ML Pipeline<br/>(point-in-time features)"]
-        DEBUG["Data Engineer<br/>(debugging)"]
-    end
-    
-    subgraph "Query Router"
-        ROUTER["Temporal Query Router"]
-    end
-    
-    subgraph "Data Stores"
-        CURR["Current-State View<br/>(materialized, refreshed hourly)"]
-        SNAP["Monthly Snapshots<br/>(pre-materialized)"]
-        BT["Bitemporal Base Table<br/>(full history)"]
-    end
-    
-    BI --> ROUTER
-    REG --> ROUTER
-    ML --> ROUTER
-    DEBUG --> ROUTER
-    
-    ROUTER -->|"No temporal clause"| CURR
-    ROUTER -->|"Month-end as-of"| SNAP
-    ROUTER -->|"Arbitrary as-of"| BT
-    
-    style ROUTER fill:#FF6B35,color:#fff
-```
-
----
-
-## ER Diagram — Temporal Query Infrastructure
-
-```mermaid
-erDiagram
-    BITEMPORAL_TABLE {
-        bigint pk
-        int natural_key
-        text attributes
-        daterange valid_range
-        tstzrange txn_range
-    }
-    
-    CURRENT_STATE_VIEW {
-        int natural_key
-        text attributes
-        text note "WHERE valid/txn = infinity"
-    }
-    
-    MONTHLY_SNAPSHOT {
-        int natural_key
-        text attributes
-        date snapshot_date
-        text note "Pre-materialized EOM state"
-    }
-    
-    QUERY_LOG {
-        bigint query_id PK
-        timestamp query_time
-        varchar query_type "current/txn_asof/valid_asof/cross"
-        varchar target_table
-        timestamp as_of_timestamp
-        int result_rows
-        decimal query_ms
-    }
-    
-    BITEMPORAL_TABLE ||--o{ CURRENT_STATE_VIEW : "materialized from"
-    BITEMPORAL_TABLE ||--o{ MONTHLY_SNAPSHOT : "pre-computed from"
-    BITEMPORAL_TABLE ||--o{ QUERY_LOG : "logged"
-```
+| Resource | Link |
+|---|---|
+| SQL:2011 Standard | Temporal query syntax (FOR SYSTEM_TIME AS OF) |
+| [Snowflake Time Travel](https://docs.snowflake.com/en/user-guide/data-time-travel) | Built-in transaction-time as-of |
+| [BigQuery Time Travel](https://cloud.google.com/bigquery/docs/time-travel) | FOR SYSTEM_TIME AS OF syntax |
+| Cross-ref: Valid vs Tx Time | [../01_Valid_vs_Transaction_Time](../01_Valid_vs_Transaction_Time/) |
+| Cross-ref: Snapshot Fact Tables | [../03_Snapshot_Fact_Tables](../03_Snapshot_Fact_Tables/) |
