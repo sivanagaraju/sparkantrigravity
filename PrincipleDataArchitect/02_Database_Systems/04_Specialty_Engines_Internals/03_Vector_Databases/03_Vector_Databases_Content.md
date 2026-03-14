@@ -1,3 +1,0 @@
-# 03 Vector Databases
-
-*Content to be developed at FAANG Principal-level depth.*

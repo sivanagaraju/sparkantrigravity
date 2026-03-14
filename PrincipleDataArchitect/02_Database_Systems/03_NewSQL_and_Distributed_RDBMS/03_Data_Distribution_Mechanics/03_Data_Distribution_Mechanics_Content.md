@@ -1,3 +1,0 @@
-# 03 Data Distribution Mechanics
-
-*Content to be developed at FAANG Principal-level depth.*

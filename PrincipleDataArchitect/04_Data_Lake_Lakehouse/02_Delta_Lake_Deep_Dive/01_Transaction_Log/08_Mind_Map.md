@@ -1,0 +1,29 @@
+# Mind Map – Delta Lake Transaction Log
+
+---
+## How to Use This Mind Map
+- For Revision: ...
+- For Application: ...
+- For Interviews: ...
+---
+## 🗺️ Theory & Concepts
+### The Delta Log
+- ACID on S3
+---
+## 🗺️ Techniques & Patterns
+...
+---
+## 🗺️ Hands-On & Code
+...
+---
+## 🗺️ Real-World Scenarios
+...
+---
+## 🗺️ Mistakes & Anti-Patterns
+...
+---
+## 🗺️ Interview Angle
+...
+---
+## 🗺️ Assessment & Reflection
+...
