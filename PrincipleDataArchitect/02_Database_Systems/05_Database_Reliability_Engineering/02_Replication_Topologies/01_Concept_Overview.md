@@ -1,42 +1,51 @@
-# Replication Topologies — Concept Overview & Deep Internals
+# Concept Overview: Replication Topologies
 
-> Single-leader, multi-leader, leaderless: how data flows between database replicas.
+## Why This Exists
 
----
+A single-server database is a single point of failure. Replication creates copies of data across multiple servers to achieve: **High Availability** (failover when the primary dies), **Read Scalability** (distribute read queries across replicas), and **Disaster Recovery** (survive data center outages). The choice of replication topology determines the trade-offs between data consistency, write performance, and operational complexity.
 
-## Comparison
+## Core Concepts & Terminology
 
-| Topology | Write Scalability | Read Scalability | Consistency | Conflict Handling |
-|---|---|---|---|---|
-| **Single-Leader** | ❌ One node | ✅ Many replicas | ✅ Strong (sync) or eventual (async) | None (single write point) |
-| **Multi-Leader** | ✅ Multiple regions | ✅ Many replicas | ⚠️ Eventual | ❌ Conflict resolution needed |
-| **Leaderless** | ✅ Any node | ✅ Any node | ⚠️ Quorum-dependent | ❌ LWW or app-level |
+| Concept | Deep Definition |
+| :--- | :--- |
+| **Physical Replication** | Byte-for-byte copying of the primary's WAL stream to replicas. The replica is an exact binary clone—same data directory layout, same indexes, same bloat. Cannot replicate selectively. |
+| **Logical Replication** | Decodes WAL into logical change events (INSERT, UPDATE, DELETE) and replays them on the subscriber. Enables selective replication (specific tables), cross-version replication, and even cross-engine migration. |
+| **Synchronous Replication** | The primary waits for at least one replica to confirm that the WAL has been written (or flushed, or applied) before returning COMMIT OK. Guarantees zero data loss (RPO = 0) but increases commit latency proportional to network round-trip time. |
+| **Asynchronous Replication** | The primary commits and returns COMMIT OK immediately, then streams WAL to replicas without waiting. Lowest latency, but a crash of the primary before WAL reaches the replica means data loss (RPO > 0). |
+| **Semi-Synchronous Replication** | The primary waits for at least one replica to acknowledge *receipt* of the WAL (not necessarily application). Balances between zero-loss and low-latency. MySQL's default "semi-sync" plugin works this way. |
+| **Streaming Replication** | Continuous, real-time WAL transfer from primary to standby (PostgreSQL terminology). The standby connects via a replication slot and receives WAL records as they are generated. |
+| **Replication Slot** | A PostgreSQL mechanism that ensures the primary retains WAL segments until the subscriber has consumed them. Prevents the primary from recycling WAL that a slow replica still needs, but can cause unbounded WAL accumulation if the replica is disconnected. |
+| **Failover** | Promoting a standby to become the new primary when the old primary is unavailable. Can be manual or automated (via tools like Patroni, pg_auto_failover, or cloud-managed services). |
+| **Split-Brain** | A catastrophic failure where two nodes both believe they are the primary and accept writes independently. Leads to data divergence that is extremely difficult to reconcile. |
+
+## Topology Catalog
 
 ```mermaid
-flowchart LR
-    subgraph "Single-Leader"
-        L1["Leader"] -->|"async/sync"| R1["Replica 1"]
-        L1 --> R2["Replica 2"]
+graph TD
+    subgraph "Single-Leader (Primary-Replica)"
+        P1[Primary] -->|WAL Stream| R1[Replica 1]
+        P1 -->|WAL Stream| R2[Replica 2]
     end
-    
-    subgraph "Multi-Leader"
-        ML1["Leader DC1"] <-->|"async"| ML2["Leader DC2"]
+
+    subgraph "Multi-Leader (Multi-Master)"
+        M1[Master A] <-->|Bidirectional| M2[Master B]
+        M1 <-->|Bidirectional| M3[Master C]
+        M2 <-->|Bidirectional| M3
     end
-    
-    subgraph "Leaderless"
-        N1["Node 1"] <--> N2["Node 2"]
-        N2 <--> N3["Node 3"]
-        N1 <--> N3
+
+    subgraph "Cascading Replication"
+        C1[Primary] -->|WAL| C2[Replica 1]
+        C2 -->|WAL| C3[Replica 2]
+        C3 -->|WAL| C4[Replica 3]
     end
 ```
 
-## War Story: GitHub — Single-Leader with Automatic Failover
+## When to Use What
 
-GitHub runs MySQL with single-leader replication. When the leader fails, Orchestrator (open-source) promotes the most up-to-date replica within seconds. Challenge: during promotion, a few seconds of writes may be lost (async replication lag). GitHub accepts this trade-off because synchronous replication would add 5ms to every write.
-
-## References
-
-| Resource | Link |
-|---|---|
-| *Designing Data-Intensive Applications* | Ch. 5: Replication |
-| [Orchestrator](https://github.com/openark/orchestrator) | MySQL HA tool |
+| Topology | Consistency | Write Scalability | Complexity | Use Case |
+| :--- | :--- | :--- | :--- | :--- |
+| **Single-Leader, Async** | Eventual | None (single writer) | Low | Read-heavy web apps, analytics replicas |
+| **Single-Leader, Sync** | Strong (RPO=0) | None | Medium | Financial systems, healthcare records |
+| **Cascading** | Eventual | None | Low | Geo-distributed read replicas (reduce primary's network load) |
+| **Multi-Leader** | Eventual (conflict resolution required) | Yes (write to any node) | Very High | Multi-region writes, collaborative editing |
+| **Leaderless (Dynamo-style)** | Tunable (quorum) | Yes | Very High | Cassandra, DynamoDB—AP systems |
