@@ -1,63 +1,64 @@
-# Data Distribution Mechanics — Concept Overview
+# Time-Series Databases (TSDB) — Concept Overview
 
 ## Why This Exists
 
-In systems dealing with internet-scale data, the limits of vertical scaling (scaling up a single machine) are reached relatively quickly due to hardware ceilings (CPU, RAM, PCIe bus limits, storage I/O). The industry pivot to horizontal scaling required data to be split across a cluster of commodity nodes. The challenge wasn't just storing the bytes, but effectively routing requests, managing hotspots, and surviving node additions or failures without shifting the entire dataset. Data distribution mechanics—ranging from simple modulo hashing to range-based splitting and consistent hashing—were invented precisely to solve the problem of dividing a monolithic dataset into discrete, manageable, and independently scalable fragments (shards/partitions).
+The explosion of observational data—from IoT sensors, high-frequency financial trading, and microservices monitoring—created a data profile that general-purpose RDBMS (Relational Database Management Systems) struggle to handle efficiently. Time-Series data is characterized by:
+1.  **Append-Only Workloads**: Data is almost never updated or deleted individually.
+2.  **High-Velocity Ingestion**: Millions of events per second.
+3.  **Time-Ordered Queries**: Data is almost always queried by time ranges and aggregated (mean, max, percentile).
+4.  **Data Decay**: Recent data is extremely valuable; older data is summarized (downsampled) or deleted (retention).
+
+Traditional B-Trees in RDBMS collapse under 100k+ inserts/sec due to index maintenance costs and lock contention. TSDBs utilize Log-Structured Merge (LSM) trees or Time-Structured Merge (TSM) trees and columnar storage to sustain massive ingestion while providing sub-second analytical queries.
 
 ## What Value It Provides
 
-*   **Engineering ROI**: Predictable sub-10ms latency regardless of dataset size (from 1TB to 10PB). Decoupled failure domains (losing one node only affects $1/N$ of the data).
-*   **Business ROI**: Infinite scalability of write throughput. Unblocks user growth curves that would otherwise be capped by the largest available AWS instance size. Cost-efficiency via utilizing fleets of cheaper instances rather than exorbitant mainframe-class machines.
+*   **Engineering ROI**: 90%+ storage reduction through specialized compression (Gorilla/Delta-Delta encoding). Sustains 10x higher ingestion rates on identical hardware vs. standard Postgres/MySQL.
+*   **Business ROI**: Enables real-time anomaly detection for fraud or industrial safety. Provides millisecond-level visibility into infrastructure health, reducing Mean Time to Recovery (MTTR) by 40-60%. 
 
 ## Where It Fits
 
-Data distribution is the foundational routing layer sitting beneath the query execution engine, but above the physical storage engine (like RocksDB or InnoDB).
+TSDBs occupy the "Observability" and "Industrial IoT" niches of the data stack. They rarely act as the "System of Record" for transactional data but are the primary sink for all event-stream data.
 
 ```mermaid
 C4Context
-    title Data Distribution in the Data Architecture Stack
+    title TSDB in the Enterprise Data Ecosystem
     
-    Person(client, "Application Client", "Sends SQL or NoSQL queries")
+    Person(dev, "SRE / Analyst", "Monitors dashboards & runs queries")
     
-    System_Boundary(cluster, "Distributed Database Cluster") {
-        System(coordinator, "Query Coordinator / Router", "Parses query, determines distribution strategy")
-        
-        System_Boundary(dist_layer, "Data Distribution Layer") {
-            Component(router, "Partition Router", "Maps Partition Key to Node/Range")
-            Component(hash_ring, "Consistent Hash Ring / Range Metadata", "Topology state")
-        }
-        
-        System_Boundary(storage, "Storage Nodes") {
-            ContainerDb(node1, "Node A (Shard 1 & 4)", "LSM Tree / B-Tree")
-            ContainerDb(node2, "Node B (Shard 2 & 5)", "LSM Tree / B-Tree")
-            ContainerDb(node3, "Node C (Shard 3 & 6)", "LSM Tree / B-Tree")
-        }
+    System_Boundary(ingestion, "Data Ingestion Pipeline") {
+        System(collector, "Data Collectors", "Telegraf / Prometheus / Vector")
+        System(queue, "Stream Buffer", "Kafka / Kinesis")
     }
     
-    Rel(client, coordinator, "Sends Query")
-    Rel(coordinator, router, "Extracts Partition Key")
-    Rel(router, hash_ring, "Looks up ownership")
-    Rel(router, node1, "Routes to Shard 1", "If key maps to Node A")
-    Rel(router, node2, "Routes to Shard 2", "If key maps to Node B")
+    System_Boundary(storage_layer, "Specialty Engines") {
+        ContainerDb(tsdb, "Time-Series DB", "InfluxDB / Timescale / QuestDB", "Highly compressed temporal storage")
+        ContainerDb(warehouse, "Data Warehouse", "Snowflake / ClickHouse", "Cold storage / Historical OLAP")
+    }
+
+    Rel(collector, queue, "Pushes metrics")
+    Rel(queue, tsdb, "Streams partitions")
+    Rel(tsdb, warehouse, "Periodic rollups / TTL export")
+    Rel(dev, tsdb, "Real-time range queries")
+    Rel(dev, warehouse, "Long-term trend analysis")
 ```
 
 ## When To Use / When NOT To Use
 
-| Scenario | Distribution Strategy | Decision | Rationale |
-| :--- | :--- | :---: | :--- |
-| **B2B SaaS with defined tenants** | Tenant-based Range/Hash | ✅ YES | Tenant boundaries naturally isolate query workloads. |
-| **Timeseries IoT data** | Time-based + Device Hash | ✅ YES | Avoids hotspots on "now" while allowing fast time range scans. |
-| **Graph traversals of social networks** | Hash Partitioning | ❌ NO | High cross-partition latency; use specialized Graph DBs or careful edge replication. |
-| **Financial ledger w/ ACID constraints** | Horizontal Sharding | ⚠️ CAUTION | Distributed transactions (2PC) over shards will destroy throughput. If required, use localized routing (Spanner/Cockroach). |
-| **Dataset < 500GB** | Any distribution | ❌ NO | Just buy a bigger single-node Postgres instance (up to 128 vCPU / 4TB RAM is cheap). Don't pay the distributed tax prematurely. |
+| Scenario | Recommendation | Rationale |
+| :--- | :--- | :--- |
+| **High-Frequency Metrics** | ✅ YES | Optimized for 1M+ inserts/sec and delta-encoding compression. |
+| **Financial Tick Data** | ✅ YES | Native support for ASOF joins and temporal window functions. |
+| **Order Management / CRM** | ❌ NO | TSDBs lack strong ACID constraints for updates/deletes. Use RDBMS. |
+| **Full-Text Log Search** | ❌ NO | TSDBs are for quantitative metrics. Use Elasticsearch / Loki for logs. |
+| **Small-Scale Monitoring** | ⚠️ CAUTION | If you have <10k points/sec, standard Postgres with an index on `created_at` is sufficient and avoids "specialty tax". |
 
 ## Key Terminology
 
 | Term | Precise Definition |
 | :--- | :--- |
-| **Shard / Partition** | A logical, mutually exclusive, and collectively exhaustive subset of the total dataset. |
-| **Partition Key / Shard Key** | The attribute(s) of a record used by the hashing or routing algorithm to determine which node holds the data. |
-| **Consistent Hashing** | A distributed hashing scheme that operates independently of the number of servers, ensuring that when an array is resized, only $K/n$ keys need to be remapped. |
-| **Virtual Nodes (vnodes)** | Abstracting physical servers into multiple logical tokens on a hash ring to ensure even data distribution, especially across heterogeneous hardware. |
-| **Scatter-Gather** | A query execution pattern where a coordinator asks *all* shards for data, aggregates the responses, and returns them to the client. Extremely inefficient at scale. |
-| **Hotspot** | A severe performance degradation occurring when a poorly chosen partition key directs a massive disproportionate share of reads or writes to a single node. |
+| **Series / Stream** | A unique sequence of data points identified by a specific metric name and set of tags/labels. |
+| **Tags / Labels** | Indexed metadata (e.g., `host_id`, `region`) used for filtering. These are usually stored once per series to save space. |
+| **Fields / Samples** | The actual quantitative measurements (e.g., `cpu_temp`, `stock_price`). Usually non-indexed. |
+| **Retention Policy** | A configuration defining how long data is kept before automatic deletion. |
+| **Downsampling** | The process of aggregating high-resolution data (e.g., 1s intervals) into lower-resolution buckets (e.g., 1m intervals) for long-term storage. |
+| **Cardinality** | The total number of unique series in the system. High cardinality is the primary "engine killer" for many TSDBs. |
